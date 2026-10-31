@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# pong - simple htop-style live ping health monitor
+set -u
+
+TARGET="${1:-1.1.1.1}"
+INTERVAL="${2:-1}"
+
+sent=0
+recv=0
+last_ms=""
+min_ms=""
+max_ms=""
+sum_ms=0
+history=()
+HIST_LEN=40
+GRAPH_ROWS=8
+
+trap 'tput cnorm; clear; exit 0' INT TERM
+
+tput civis
+clear
+
+bar() {
+    local pct=$1 width=30 filled color reset="\033[0m"
+    if   [ "$pct" -ge 90 ]; then color="\033[32m"
+    elif [ "$pct" -ge 70 ]; then color="\033[33m"
+    else color="\033[31m"
+    fi
+    filled=$(( pct * width / 100 ))
+    local bar_str=""
+    for ((i=0; i<width; i++)); do
+        if [ "$i" -lt "$filled" ]; then bar_str+="█"; else bar_str+="░"; fi
+    done
+    printf "%b%s%b" "$color" "$bar_str" "$reset"
+}
+
+status_emoji() {
+    local pct=$1 ms=$2
+    if [ "$pct" -lt 90 ]; then echo "🔴"
+    elif [ -n "$ms" ] && awk "BEGIN{exit !($ms > 150)}"; then echo "🟡"
+    else echo "🟢"
+    fi
+}
+
+while true; do
+    sent=$((sent + 1))
+    out=$(ping -c 1 -W 5000 "$TARGET" 2>/dev/null)
+    ms=$(echo "$out" | grep -oE 'time=[0-9.]+' | cut -d= -f2)
+
+    if [ -n "$ms" ]; then
+        recv=$((recv + 1))
+        last_ms="$ms"
+        sum_ms=$(awk "BEGIN{print $sum_ms + $ms}")
+        if [ -z "$min_ms" ] || awk "BEGIN{exit !($ms < $min_ms)}"; then min_ms=$ms; fi
+        if [ -z "$max_ms" ] || awk "BEGIN{exit !($ms > $max_ms)}"; then max_ms=$ms; fi
+        history+=("$ms")
+    else
+        last_ms=""
+        history+=("-1")
+    fi
+
+    if [ "${#history[@]}" -gt "$HIST_LEN" ]; then
+        history=("${history[@]:1}")
+    fi
+
+    loss_pct=$(awk "BEGIN{printf \"%d\", (($sent-$recv)/$sent)*100}")
+    ok_pct=$((100 - loss_pct))
+    avg_ms=""
+    [ "$recv" -gt 0 ] && avg_ms=$(awk "BEGIN{printf \"%.1f\", $sum_ms/$recv}")
+
+    emoji=$(status_emoji "$ok_pct" "${last_ms:-9999}")
+
+    tput cup 0 0
+    printf "\033[1m  pong → %s\033[0m\033[K\n" "$TARGET"
+    printf "  ─────────────────────────────────────────────\033[K\n"
+    printf "  status:     %s  " "$emoji"
+    if [ -n "$last_ms" ]; then printf "%sms\033[K\n" "$last_ms"; else printf "timeout\033[K\n"; fi
+    printf "  sent/recv:  %d / %d\033[K\n" "$sent" "$recv"
+    printf "  health:     "
+    bar "$ok_pct"
+    printf "  %d%%\033[K\n" "$ok_pct"
+    printf "  loss:       %d%%\033[K\n" "$loss_pct"
+    printf "  min/avg/max: %sms / %sms / %sms\033[K\n" "${min_ms:-—}" "${avg_ms:-—}" "${max_ms:-—}"
+    printf "  ─────────────────────────────────────────────\033[K\n"
+    printf "%s\n" "${history[@]}" | awk -v rows="$GRAPH_ROWS" '
+        BEGIN {
+            esc = sprintf("%c", 27)
+            split("▁ ▂ ▃ ▄ ▅ ▆ ▇ █", blk, " ")
+            nt = split("20 40 60 80 100 150 200 300 500 800 1500", th, " ")
+            split("34 40 46 82 118 154 190 226 214 208 202 196", pal, " ")
+            n = split("50 100 200 500 1000 2000 5000 10000", steps, " ")
+        }
+        { v[NR] = $1; if ($1 > mx) mx = $1 }
+        END {
+            scale = steps[n]
+            for (k = n; k >= 1; k--) if (steps[k] >= mx) scale = steps[k]
+            for (r = rows; r >= 1; r--) {
+                label = (r == rows) ? sprintf("%5dms", scale) : (r == 1 ? "    0ms" : "       ")
+                line = "  " label " │"
+                for (i = 1; i <= NR; i++) {
+                    if (v[i] < 0) {
+                        line = line (r == 1 ? esc "[31m✗" esc "[0m" : " ")
+                        continue
+                    }
+                    units = int(v[i] / scale * rows * 8 + 0.5)
+                    if (units < 1) units = 1
+                    cell = units - (r - 1) * 8
+                    if (cell > 8) cell = 8
+                    t = (v[i] <= 10) ? 0 : log(v[i] / 10) / log(150)
+                    if (t > 1) t = 1
+                    h = 2 * (1 - t)
+                    cr = (h < 1) ? 1 : 2 - h
+                    cg = (h < 1) ? h : 1
+                    col = sprintf("38;2;%d;%d;%d", cr * 230, cg * 230, 0)
+                    line = line (cell <= 0 ? " " : esc "[" col "m" blk[cell] esc "[0m")
+                }
+                printf "%s%s[K\n", line, esc
+            }
+        }'
+    printf "\033[K\n"
+    printf "  ctrl+c to quit\033[K\n"
+    printf "\033[J"
+
+    sleep "$INTERVAL"
+done
